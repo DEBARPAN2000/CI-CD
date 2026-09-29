@@ -62,9 +62,11 @@ jobs:
           IMAGE_REF: ${{ inputs.image-ref }}
           COMPOSE_FILE: ${{ inputs.compose-file }}
           COMPOSE_SERVICE: ${{ inputs.compose-service }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
           docker pull "$IMAGE_REF"
           docker compose -f "$COMPOSE_FILE" down || true
           docker compose -f "$COMPOSE_FILE" up -d "$COMPOSE_SERVICE"
@@ -126,7 +128,8 @@ jobs:
           # --network host lets ZAP reach an app published on the runner's localhost.
           # Call the scripts directly (no login shell: `bash -lc` resets PATH and hides /zap/*.py).
           # Scan findings are gated by the "Parse and gate on findings" step, so scan exit codes are ignored.
-          zap() { docker run --rm --network host --user root -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable "$@" || true; }
+          chmod a+w "$PWD"  # the zap user in the container must be able to write reports
+          zap() { docker run --rm --network host -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable "$@" || true; }
           zap zap-baseline.py -t "$TARGET_URL" -J baseline-report.json
           zap zap-full-scan.py -t "$TARGET_URL" -T 10 -J zap-report.json -r zap-report.html
 
