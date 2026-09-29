@@ -81,7 +81,7 @@ A reusable, enterprise-grade GitHub Actions CI/CD template for .NET and Python a
 
 1. **Clone and configure**:
    ```bash
-   git clone https://github.com/DEBARPAN2000/CI-CD.git
+   git clone https://github.com/debarpan-bose-chowdhury/CI-CD.git
    cd CI-CD
    ```
 
@@ -113,7 +113,7 @@ cp examples/python-consumer-workflow.yml .github/workflows/ci-cd-pipeline.yml
 ```
 
 #### Step 2: Update Workflow References
-Replace `DEBARPAN2000` with your organization:
+Replace `debarpan-bose-chowdhury` with your organization:
 ```yaml
 uses: YOUR-ORG/CI-CD/.github/workflows/ci.yml@main
 ```
@@ -214,6 +214,7 @@ git push origin main
 - python-workdir: '.'                      # Working directory
 - python-test-command: ''                  # Override pytest
 - lint-command: ''                         # Custom linter
+- codeql-languages: 'cpp,csharp,go,java,javascript,python,ruby'  # Narrow to your stack, e.g. 'python'
 - run-sonarqube: false                     # Enable SonarQube
 - sonar-project-key: ''                    # SQ project key
 ```
@@ -226,6 +227,7 @@ git push origin main
 - image-owner: ''                          # Defaults to github.repository_owner for GHCR, omitted otherwise
 - image-name: 'my-app'                     # Image name (repo name if empty)
 - image-tag: 'latest'                      # Image tag
+- tag-latest: true                         # Also move :latest (false for PR builds)
 - build-context: '.'                       # Docker build context
 - dockerfile-path: ''                      # Custom Dockerfile path
 - dotnet-version: '8.0'                    # For template Dockerfile
@@ -246,6 +248,7 @@ git push origin main
 - health-check-url: 'http://localhost/health'
 - health-check-max-retries: '30'
 - health-check-delay: '10'
+- tls-cert: false                          # Generate ./certs/{cert,key}.pem for HTTPS apps (compose mounts ./certs)
 ```
 
 ### DAST Scan (dast-smoke.yml)
@@ -254,6 +257,10 @@ git push origin main
 - target-url: (required)                   # URL to scan
 - dast-threshold: 'medium' | 'high' | 'critical'
 - smoke-endpoints: '/health,/api/status'   # Comma-separated
+- image-ref: ''                            # If set, the app is started from this image via compose inside the DAST job
+- compose-file: 'docker-compose.staging.yml'
+- compose-service: 'app'
+- tls-cert: false                          # Generate ./certs for HTTPS apps (self-signed; smoke/health checks use curl -k)
 ```
 
 ### Deploy Production (deploy-production.yml)
@@ -270,6 +277,7 @@ git push origin main
 - health-check-url: 'http://localhost/health'
 - health-check-max-retries: '30'
 - health-check-delay: '10'
+- tls-cert: false                          # Generate ./certs/{cert,key}.pem for HTTPS apps
 ```
 
 For non-GHCR registries, set `image-owner` when the repository path includes a namespace or owner segment; leave it empty only for top-level image paths.
@@ -458,7 +466,7 @@ Push changes to `main` branch. Consumer repos will automatically use latest via 
 
 To use a specific version:
 ```yaml
-uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@v1.0.0
+uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@v1.0.0
 ```
 
 ### Contributing Improvements
