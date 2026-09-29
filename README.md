@@ -6,6 +6,7 @@ A reusable, enterprise-grade GitHub Actions CI/CD template for .NET and Python a
 
 ### Core Capabilities
 - **Multi-language support**: Auto-detection for .NET and Python projects
+- **Multi-image pipelines**: Build, smoke-test, deploy, scan and monitor several images (same or different languages) from one repo — see [Multi-image pipelines](#-multi-image-pipelines)
 - **Reusable workflows**: Use `workflow_call` pattern—no copy/paste needed
 - **Security gates**: SCA → SBOM → CodeQL → DAST → Production
 - **Automated versioning**: Semantic versioning from Conventional Commits
@@ -228,6 +229,7 @@ git push origin main
 - image-name: 'my-app'                     # Image name (repo name if empty)
 - image-tag: 'latest'                      # Image tag
 - tag-latest: true                         # Also move :latest (false for PR builds)
+- images: ''                               # JSON array of images to build in one run (see Multi-image pipelines)
 - build-context: '.'                       # Docker build context
 - dockerfile-path: ''                      # Custom Dockerfile path
 - dotnet-version: '8.0'                    # For template Dockerfile
@@ -237,6 +239,7 @@ git push origin main
 ### Deploy Staging (deploy-staging.yml)
 
 ```yaml
+- images: ''                               # Multi-image mode: JSON array; role=service entries are deployed together
 - image-ref: ''                            # Optional full image reference override
 - registry: 'ghcr.io'                      # Used when image-ref is omitted
 - image-owner: ''                          # Defaults to github.repository_owner for GHCR, omitted otherwise
@@ -258,6 +261,10 @@ git push origin main
 - dast-threshold: 'medium' | 'high' | 'critical'
 - smoke-endpoints: '/health,/api/status'   # Comma-separated
 - image-ref: ''                            # If set, the app is started from this image via compose inside the DAST job
+- images: ''                               # Multi-image mode: role=service entries are started together (use with registry / image-owner / image-tag)
+- registry: 'ghcr.io'                      # Multi-image mode only
+- image-owner: ''                          # Multi-image mode only
+- image-tag: ''                            # Multi-image mode only; defaults to github.sha
 - compose-file: 'docker-compose.staging.yml'
 - compose-service: 'app'
 - tls-cert: false                          # Generate ./certs for HTTPS apps (self-signed; smoke/health checks use curl -k)
@@ -266,6 +273,7 @@ git push origin main
 ### Deploy Production (deploy-production.yml)
 
 ```yaml
+- images: ''                               # Multi-image mode: JSON array; role=service entries are deployed together
 - image-ref: ''                            # Optional full image reference override
 - registry: 'ghcr.io'                      # Used when image-ref is omitted
 - image-owner: ''                          # Defaults to github.repository_owner for GHCR, omitted otherwise
@@ -304,14 +312,16 @@ For non-GHCR registries, set `image-owner` when the repository path includes a n
 
 ```yaml
 - registry: 'ghcr.io'
-- image-name: (required)
-- tags-to-scan: 'latest,v1.0.0'            # Comma-separated
+- image-name: ''                           # Single image path (e.g. owner/app)
+- images: ''                               # JSON array of image paths, e.g. ["owner/api","owner/worker"]; overrides image-name
+- tags-to-scan: '["latest","v1.0.0"]'      # JSON array; every image is scanned for every tag
 - fail-on-critical: false                  # Don't block release
 ```
 
 ### Continuous Monitoring (continuous-monitoring.yml)
 
 ```yaml
+- images: ''                               # Multi-image mode: each role=service entry is monitored at its own health-url
 - image-ref: ''                            # Optional full image reference override
 - registry: 'ghcr.io'                      # Used when image-ref is omitted
 - image-owner: ''                          # Defaults to github.repository_owner for GHCR, omitted otherwise
@@ -322,6 +332,58 @@ For non-GHCR registries, set `image-owner` when the repository path includes a n
 - max-checks: '3'
 - sbom-file: ''                            # Optional
 ```
+
+---
+
+## 🐳 Multi-image pipelines
+
+A repository can ship several images — services, batch jobs, different languages — through the same
+pipeline. Pass an `images` JSON array to the reusable workflows; when `images` is empty every workflow
+behaves exactly as before (single image), so existing consumers need no changes.
+
+### The `images` schema
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | Image name (lower-cased; `[a-z0-9._-]`, unique in the array). Published as `<registry>/<owner>/<name>:<tag>`. |
+| `language` | unless `dockerfile` is set | `python` or `dotnet`; selects the template Dockerfile in `docker/`. |
+| `dockerfile` | no | Your own Dockerfile (relative to the repo root). Any language. |
+| `context` | no | Build context (default: `build-context`, i.e. `.`). |
+| `role` | no | `service` (HTTP service deployed via compose) or `batch` (default; built and scanned, never deployed). |
+| `smoke-command` | no, `batch` only | Run once after the push with `docker run --rm <image> <smoke-command>`; non-zero exit fails the pipeline. The words are passed as container arguments (they replace `CMD`, or are appended to an `ENTRYPOINT`). |
+| `compose-service` | no, `service` only | Compose service to start (default: the image name). |
+| `health-url` | required for `service` in deploy/monitoring | URL polled after deploy and during monitoring. |
+| `build-args` | no | Map of extra Docker build args (`DOTNET_VERSION` / `PYTHON_VERSION` are set from the workflow inputs). |
+
+All images in a run share one tag (`image-tag`, normally the commit SHA); `:latest` moves for every image when `tag-latest` is true.
+
+### What each workflow does with it
+
+| Workflow | Behaviour |
+|---|---|
+| `docker-build-push.yml` | Builds every image in a matrix (`fail-fast: false`: all failures are reported, downstream jobs are blocked), then smoke-runs `batch` images that define `smoke-command`. Output `image-names` lists what was built. |
+| `deploy-staging.yml` / `deploy-production.yml` | Deploys every `role: service` image **together in one compose stack**: pulls all images, exports `IMAGE_REF_<NAME>` for each (name upper-cased, non-alphanumerics → `_`, e.g. `IMAGE_REF_SWING_TRADING_SYSTEM`), runs `docker compose up -d` for the services, then health-checks each `health-url`. Production records each service's previous image and rolls the stack back if anything fails. |
+| `dast-smoke.yml` | Starts all `service` images the same way, then scans `target-url` (one URL per call). |
+| `continuous-monitoring.yml` | Health, compliance and synthetic checks run once per `service` at its own `health-url`. |
+| `image-periodic-scan.yml` | `images` is a plain JSON array of image paths; every image is scanned for every tag. |
+
+Use the exported variables in your compose file. Keeping `IMAGE_REF` as a fallback lets the same file work
+for single-image runs (where `IMAGE_REF` is also exported):
+
+```yaml
+services:
+  app:
+    image: ${IMAGE_REF_APP:-${IMAGE_REF:-ghcr.io/me/app:latest}}
+```
+
+Notes:
+
+- Job-level `with:` cannot read `env`, so repeat the JSON in each job (see `examples/multi-image-consumer-workflow.yml`). The same array can be passed to every workflow; each one only looks at the fields and roles it needs.
+- The `image-ref` and `image-digest` outputs of `docker-build-push.yml` are only reliable in single-image mode; use `image-names` plus the shared tag in multi-image mode.
+- Batch images are not deployed, DAST-scanned or monitored. They are built, pushed, smoke-run (optional) and covered by the periodic scan.
+
+Example (mixed languages): see [`examples/multi-image-consumer-workflow.yml`](examples/multi-image-consumer-workflow.yml).
+The resolve logic is unit-tested by `tests/multi-image/run.sh` (run in `template-validation.yml`).
 
 ---
 

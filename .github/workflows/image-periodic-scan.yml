@@ -8,7 +8,12 @@ on:
         default: ghcr.io
       image-name:
         type: string
-        required: true
+        default: ''
+        description: 'Single image to scan (registry path without registry host, e.g. owner/app). Ignored when images is set'
+      images:
+        type: string
+        default: ''
+        description: 'JSON array of image paths to scan, e.g. ["owner/api","owner/worker"]; every image is scanned for every tag in tags-to-scan'
       tags-to-scan:
         type: string
         default: '["latest"]'
@@ -33,7 +38,9 @@ jobs:
   scan-image:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
+        image: ${{ fromJSON(inputs.images != '' && inputs.images || format('["{0}"]', inputs.image-name)) }}
         tag: ${{ fromJSON(inputs.tags-to-scan) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -44,11 +51,12 @@ jobs:
         run: |
           set -euo pipefail
           registry='${{ inputs.registry }}'
-          image='${{ inputs.image-name }}'
+          image='${{ matrix.image }}'
           tag='${{ matrix.tag }}'
 
           full_ref="${registry}/${image}:${tag}"
           echo "full-ref=${full_ref}" >> "$GITHUB_OUTPUT"
+          echo "slug=$(printf '%s-%s' "$image" "$tag" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
           echo "Scanning image: ${full_ref}"
 
       - name: Login to registry
@@ -154,7 +162,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-reports-${{ matrix.tag }}
+          name: scan-reports-${{ inputs.images == '' && matrix.tag || steps.image-ref.outputs.slug }}
           path: |
             sbom.json
             vulnerabilities.json
@@ -228,6 +236,10 @@ jobs:
           set -euo pipefail
 
           image_tag='${{ matrix.tag }}'
+          if [ -n '${{ inputs.images }}' ]; then
+            # Several images share the same tags, so the issue must be keyed by image as well.
+            image_tag='${{ matrix.image }}:${{ matrix.tag }}'
+          fi
           critical_count='${{ steps.scan.outputs.critical-count }}'
           high_count='${{ steps.scan.outputs.high-count }}'
           total_count='${{ steps.scan.outputs.total-count }}'

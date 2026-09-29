@@ -14,6 +14,25 @@ on:
         type: string
         default: /health
         description: 'Comma-separated list of endpoints to smoke-test'
+      images:
+        type: string
+        default: ''
+        description: >-
+          JSON array of images (same schema as docker-build-push.yml). When set, every entry with role
+          "service" is pulled and started together via compose (IMAGE_REF_<NAME> is exported for each)
+          before scanning target-url. Use it with registry, image-owner and image-tag.
+      registry:
+        type: string
+        default: ghcr.io
+        description: 'Registry of the images entries (multi-image mode)'
+      image-owner:
+        type: string
+        default: ''
+        description: 'Registry owner of the images entries; defaults to the repository owner on ghcr.io'
+      image-tag:
+        type: string
+        default: ''
+        description: 'Tag shared by the images entries; defaults to the commit SHA'
       image-ref:
         type: string
         default: ''
@@ -24,6 +43,7 @@ on:
       compose-service:
         type: string
         default: app
+        description: 'Single-image mode only; in multi-image mode use compose-service per images entry (defaults to the image name)'
       tls-cert:
         type: boolean
         default: false
@@ -55,21 +75,102 @@ jobs:
             -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
           chmod 644 certs/key.pem certs/cert.pem
 
-      - name: Start app
-        if: ${{ inputs.image-ref != '' }}
+      - name: Resolve image references
+        if: ${{ inputs.image-ref != '' || inputs.images != '' }}
+        id: resolve-image
         shell: bash
         env:
+          IMAGES_INPUT: ${{ inputs.images }}
           IMAGE_REF: ${{ inputs.image-ref }}
-          COMPOSE_FILE: ${{ inputs.compose-file }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
           COMPOSE_SERVICE: ${{ inputs.compose-service }}
+          HEALTH_URL: ''
+          REQUIRE_HEALTH: 'false'
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          registry=$(lower "$REGISTRY")
+          owner="$IMAGE_OWNER"
+          if [ -z "$owner" ] && [ "$registry" = 'ghcr.io' ]; then
+            owner="$REPO_OWNER"
+          fi
+          owner=$(lower "$owner")
+          tag="${IMAGE_TAG:-$SHA}"
+
+          if [ -n "$IMAGES_INPUT" ]; then
+            # Multi-image mode: every role=service entry becomes one deployable service.
+            services=$(printf '%s' "$IMAGES_INPUT" | jq -c \
+              --arg registry "$registry" --arg owner "$owner" --arg tag "$tag" --arg require_health "$REQUIRE_HEALTH" '
+              if type != "array" then error("images must be a JSON array") else . end
+              | map(select((.role // "batch") == "service")
+                  | ((.name // "") | ascii_downcase) as $name
+                  | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                  | {
+                      name: $name,
+                      key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")),
+                      ref: ($registry + "/" + (if $owner != "" then $owner + "/" else "" end) + $name + ":" + $tag),
+                      registry: $registry,
+                      service: (.["compose-service"] // $name),
+                      health: (.["health-url"] // "")
+                    }
+                  | if $require_health == "true" and .health == "" then error("service image " + .name + " needs a health-url") else . end)
+              | if length == 0 then error("images contains no role=service entry") else . end
+              | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+          else
+            # Single-image mode: one service, exactly as before.
+            if [ -n "$IMAGE_REF" ]; then
+              image_ref="$IMAGE_REF"
+              registry=$(lower "${image_ref%%/*}")
+            else
+              image_name=$(lower "${IMAGE_NAME:-$REPO_NAME}")
+              image_path="$image_name"
+              if [ -n "$owner" ]; then
+                image_path="${owner}/$image_name"
+              fi
+              image_ref="${registry}/${image_path}:${tag}"
+            fi
+            services=$(jq -cn --arg name "$(lower "${IMAGE_NAME:-$REPO_NAME}")" --arg ref "$image_ref" --arg registry "$registry" \
+              --arg service "$COMPOSE_SERVICE" --arg health "$HEALTH_URL" \
+              '[{name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), ref: $ref, registry: $registry, service: $service, health: $health}]')
+          fi
+
+          {
+            echo "services=$services"
+            echo "ghcr=$(printf '%s' "$services" | jq 'any(.[]; .registry == "ghcr.io")')"
+            # First service's ref; keeps single-image consumers working (outputs may be dropped if they match a secret).
+            echo "image-ref=$(printf '%s' "$services" | jq -r '.[0].ref')"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "$services" | jq -r '.[] | "  - \(.name) -> \(.ref) (compose service: \(.service))"'
+
+      - name: Start app
+        if: ${{ inputs.image-ref != '' || inputs.images != '' }}
+        shell: bash
+        env:
+          SERVICES: ${{ steps.resolve-image.outputs.services }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
-          docker pull "$IMAGE_REF"
+          if [ "$(jq 'any(.[]; .registry == "ghcr.io")' <<< "$SERVICES")" = 'true' ]; then
+            echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          fi
+          while read -r key ref; do
+            docker pull "$ref"
+            export "IMAGE_REF_${key}=${ref}"
+          done < <(jq -r '.[] | "\(.key) \(.ref)"' <<< "$SERVICES")
+          if [ "$(jq 'length' <<< "$SERVICES")" = '1' ]; then
+            export IMAGE_REF="$(jq -r '.[0].ref' <<< "$SERVICES")"
+          fi
+          mapfile -t compose_services < <(jq -r '.[].service' <<< "$SERVICES" | sort -u)
           docker compose -f "$COMPOSE_FILE" down || true
-          docker compose -f "$COMPOSE_FILE" up -d "$COMPOSE_SERVICE"
+          docker compose -f "$COMPOSE_FILE" up -d "${compose_services[@]}"
 
       - name: Test health endpoints
         shell: bash

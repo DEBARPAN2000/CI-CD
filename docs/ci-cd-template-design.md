@@ -31,6 +31,14 @@ Recommended structure:
 - `docker/Dockerfile.dotnet`
 - `docker/Dockerfile.python`
 
+### Multi-image support
+The build, deploy, DAST and monitoring workflows accept an optional `images` JSON array (name, language,
+dockerfile, context, role `service|batch`, smoke-command, compose-service, health-url, build-args) so one
+repository can ship several images, in the same or different languages, through one pipeline. Builds run as a
+matrix and share one tag; `service` images deploy together in a single compose stack (compose receives
+`IMAGE_REF_<NAME>` per image); `batch` images are built, optionally smoke-run and scanned but not deployed.
+Empty `images` keeps the original single-image behaviour. Details: README, "Multi-image pipelines".
+
 Each reusable workflow should accept inputs for:
 - repository type
 - language override (`dotnet`, `python`, or `auto`)

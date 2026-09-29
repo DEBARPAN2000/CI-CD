@@ -3,6 +3,14 @@ name: Reusable Deploy Staging
 on:
   workflow_call:
     inputs:
+      images:
+        type: string
+        default: ''
+        description: >-
+          JSON array of images (same schema as docker-build-push.yml). Every entry with role "service" is
+          pulled and deployed together in one compose stack; the compose file receives IMAGE_REF_<NAME>
+          for each (name upper-cased, non-alphanumerics replaced by "_") and each service is health-checked
+          at its own health-url. Empty = single-image mode using the inputs below.
       image-ref:
         type: string
         default: ''
@@ -27,9 +35,11 @@ on:
       compose-service:
         type: string
         default: app
+        description: 'Single-image mode only; in multi-image mode use compose-service per images entry (defaults to the image name)'
       health-check-url:
         type: string
         default: http://localhost/health
+        description: 'Single-image mode only; in multi-image mode use health-url per images entry'
       health-check-max-retries:
         type: string
         default: '30'
@@ -53,57 +63,92 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Resolve image reference
+      - name: Resolve image references
         id: resolve-image
         shell: bash
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+          IMAGE_REF: ${{ inputs.image-ref }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
+          COMPOSE_SERVICE: ${{ inputs.compose-service }}
+          HEALTH_URL: ${{ inputs.health-check-url }}
+          REQUIRE_HEALTH: 'true'
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          image_ref='${{ inputs.image-ref }}'
-          if [ -z "$image_ref" ]; then
-            image_name='${{ inputs.image-name }}'
-            if [ -z "$image_name" ]; then
-              image_name='${{ github.event.repository.name }}'
-            fi
-            image_tag='${{ inputs.image-tag }}'
-            if [ -z "$image_tag" ]; then
-              image_tag='${{ github.sha }}'
-            fi
-            registry='${{ inputs.registry }}'
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_owner='${{ inputs.image-owner }}'
-            if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
-              image_owner='${{ github.repository_owner }}'
-            fi
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            image_path="$image_name"
-            if [ -n "$image_owner" ]; then
-              image_path="${image_owner}/$image_name"
-            fi
-            image_ref="${registry}/${image_path}:$image_tag"
-          else
-            registry="${image_ref%%/*}"
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          registry=$(lower "$REGISTRY")
+          owner="$IMAGE_OWNER"
+          if [ -z "$owner" ] && [ "$registry" = 'ghcr.io' ]; then
+            owner="$REPO_OWNER"
           fi
-          echo "image-ref=$image_ref" >> "$GITHUB_OUTPUT"
-          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          owner=$(lower "$owner")
+          tag="${IMAGE_TAG:-$SHA}"
+
+          if [ -n "$IMAGES_INPUT" ]; then
+            # Multi-image mode: every role=service entry becomes one deployable service.
+            services=$(printf '%s' "$IMAGES_INPUT" | jq -c \
+              --arg registry "$registry" --arg owner "$owner" --arg tag "$tag" --arg require_health "$REQUIRE_HEALTH" '
+              if type != "array" then error("images must be a JSON array") else . end
+              | map(select((.role // "batch") == "service")
+                  | ((.name // "") | ascii_downcase) as $name
+                  | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                  | {
+                      name: $name,
+                      key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")),
+                      ref: ($registry + "/" + (if $owner != "" then $owner + "/" else "" end) + $name + ":" + $tag),
+                      registry: $registry,
+                      service: (.["compose-service"] // $name),
+                      health: (.["health-url"] // "")
+                    }
+                  | if $require_health == "true" and .health == "" then error("service image " + .name + " needs a health-url") else . end)
+              | if length == 0 then error("images contains no role=service entry") else . end
+              | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+          else
+            # Single-image mode: one service, exactly as before.
+            if [ -n "$IMAGE_REF" ]; then
+              image_ref="$IMAGE_REF"
+              registry=$(lower "${image_ref%%/*}")
+            else
+              image_name=$(lower "${IMAGE_NAME:-$REPO_NAME}")
+              image_path="$image_name"
+              if [ -n "$owner" ]; then
+                image_path="${owner}/$image_name"
+              fi
+              image_ref="${registry}/${image_path}:${tag}"
+            fi
+            services=$(jq -cn --arg name "$(lower "${IMAGE_NAME:-$REPO_NAME}")" --arg ref "$image_ref" --arg registry "$registry" \
+              --arg service "$COMPOSE_SERVICE" --arg health "$HEALTH_URL" \
+              '[{name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), ref: $ref, registry: $registry, service: $service, health: $health}]')
+          fi
+
+          {
+            echo "services=$services"
+            echo "ghcr=$(printf '%s' "$services" | jq 'any(.[]; .registry == "ghcr.io")')"
+            # First service's ref; keeps single-image consumers working (outputs may be dropped if they match a secret).
+            echo "image-ref=$(printf '%s' "$services" | jq -r '.[0].ref')"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "$services" | jq -r '.[] | "  - \(.name) -> \(.ref) (compose service: \(.service))"'
 
       - name: Login to GHCR (for private images)
-        if: ${{ steps.resolve-image.outputs.registry == 'ghcr.io' }}
+        if: ${{ steps.resolve-image.outputs.ghcr == 'true' }}
         shell: bash
         run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
-      - name: Pull latest image
+      - name: Pull images
         shell: bash
+        env:
+          SERVICES: ${{ steps.resolve-image.outputs.services }}
         run: |
           set -euo pipefail
-          docker pull '${{ steps.resolve-image.outputs.image-ref }}' || exit 1
+          while read -r ref; do
+            docker pull "$ref"
+          done < <(jq -r '.[].ref' <<< "$SERVICES")
 
       - name: Create local TLS certificate
         if: ${{ inputs.tls-cert }}
@@ -118,50 +163,73 @@ jobs:
 
       - name: Deploy via Docker Compose
         shell: bash
+        env:
+          SERVICES: ${{ steps.resolve-image.outputs.services }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
         run: |
           set -euo pipefail
-          if [ ! -f '${{ inputs.compose-file }}' ]; then
-            echo "ERROR: docker-compose file not found: ${{ inputs.compose-file }}" >&2
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "ERROR: docker-compose file not found: $COMPOSE_FILE" >&2
             exit 1
           fi
 
-          # Set image in environment variable for docker-compose substitution
-          export IMAGE_REF='${{ steps.resolve-image.outputs.image-ref }}'
+          # Expose every image to docker-compose substitution as IMAGE_REF_<NAME>; a single image is
+          # also exposed as IMAGE_REF, as before.
+          while read -r key ref; do
+            export "IMAGE_REF_${key}=${ref}"
+          done < <(jq -r '.[] | "\(.key) \(.ref)"' <<< "$SERVICES")
+          if [ "$(jq 'length' <<< "$SERVICES")" = '1' ]; then
+            export IMAGE_REF="$(jq -r '.[0].ref' <<< "$SERVICES")"
+          fi
+          mapfile -t compose_services < <(jq -r '.[].service' <<< "$SERVICES" | sort -u)
 
           # Stop and remove old containers
-          docker compose -f '${{ inputs.compose-file }}' down || true
+          docker compose -f "$COMPOSE_FILE" down || true
 
           # Start new deployment
-          docker compose -f '${{ inputs.compose-file }}' up -d '${{ inputs.compose-service }}'
-      - name: Wait for health check
+          docker compose -f "$COMPOSE_FILE" up -d "${compose_services[@]}"
+
+      - name: Wait for health checks
         shell: bash
+        env:
+          SERVICES: ${{ steps.resolve-image.outputs.services }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
+          MAX_RETRIES: ${{ inputs.health-check-max-retries }}
+          DELAY: ${{ inputs.health-check-delay }}
         run: |
           set -euo pipefail
-          max_retries=${{ inputs.health-check-max-retries }}
-          delay=${{ inputs.health-check-delay }}
-          url='${{ inputs.health-check-url }}'
-
-          for i in $(seq 1 "$max_retries"); do
-            echo "[${i}/${max_retries}] Checking health: ${url}"
-            if curl -ksf "$url" >/dev/null 2>&1; then
-              echo "✓ Health check passed"
-              exit 0
+          failed=0
+          while read -r name url; do
+            ok=0
+            for i in $(seq 1 "$MAX_RETRIES"); do
+              echo "[${name}] [${i}/${MAX_RETRIES}] Checking health: ${url}"
+              if curl -ksf "$url" >/dev/null 2>&1; then
+                echo "✓ ${name}: health check passed"
+                ok=1
+                break
+              fi
+              if [ "$i" -lt "$MAX_RETRIES" ]; then
+                echo "  Waiting ${DELAY}s before retry..."
+                sleep "$DELAY"
+              fi
+            done
+            if [ "$ok" != 1 ]; then
+              echo "✗ ${name}: health check failed after $MAX_RETRIES attempts" >&2
+              failed=1
             fi
-            if [ "$i" -lt "$max_retries" ]; then
-              echo "  Waiting ${delay}s before retry..."
-              sleep "$delay"
-            fi
-          done
+          done < <(jq -r '.[] | "\(.name) \(.health)"' <<< "$SERVICES")
 
-          echo "✗ Health check failed after $max_retries attempts" >&2
-          docker compose -f '${{ inputs.compose-file }}' logs
-          exit 1
+          if [ "$failed" != 0 ]; then
+            docker compose -f "$COMPOSE_FILE" logs
+            exit 1
+          fi
 
       - name: Log deployment status
         if: success()
         shell: bash
+        env:
+          SERVICES: ${{ steps.resolve-image.outputs.services }}
         run: |
           echo "✓ Staging deployment successful"
-          echo "  Image: ${{ steps.resolve-image.outputs.image-ref }}"
           echo "  Environment: ${{ inputs.environment-name }}"
-          echo "  Health check: ${{ inputs.health-check-url }}"
+          jq -r '.[] | "  \(.name): \(.ref) (health: \(.health))"' <<< "$SERVICES"
