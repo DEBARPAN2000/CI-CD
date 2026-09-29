@@ -94,7 +94,7 @@ jobs:
           fi
           
           # Check key elements are present
-          grep -q "uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@main" examples/dotnet-consumer-workflow.yml || {
+          grep -q "uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@main" examples/dotnet-consumer-workflow.yml || {
             echo "✗ Missing CI workflow reference"
             exit 1
           }
@@ -124,7 +124,7 @@ jobs:
           fi
           
           # Check key elements are present
-          grep -q "uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@main" examples/python-consumer-workflow.yml || {
+          grep -q "uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@main" examples/python-consumer-workflow.yml || {
             echo "✗ Missing CI workflow reference"
             exit 1
           }

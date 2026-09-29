@@ -18,7 +18,7 @@ permissions:
 jobs:
   ci:
     name: CI (Python)
-    uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@main
     with:
       language: python
       python-version: '3.12'
@@ -36,7 +36,7 @@ jobs:
     name: Build Docker Image
     needs: ci
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: DEBARPAN2000/CI-CD/.github/workflows/docker-build-push.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/docker-build-push.yml@main
     with:
       language: python
       registry: ghcr.io
@@ -53,7 +53,7 @@ jobs:
     name: Deploy to Staging
     needs: build-docker
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: DEBARPAN2000/CI-CD/.github/workflows/deploy-staging.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-staging.yml@main
     with:
       registry: ghcr.io
       image-owner: ${{ github.repository_owner }}
@@ -70,7 +70,7 @@ jobs:
     name: DAST Security Scan
     needs: deploy-staging
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: DEBARPAN2000/CI-CD/.github/workflows/dast-smoke.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/dast-smoke.yml@main
     with:
       target-url: http://staging-app:5000
       dast-threshold: medium
@@ -89,7 +89,7 @@ jobs:
     name: Deploy to Production
     needs: [build-docker, approval]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: DEBARPAN2000/CI-CD/.github/workflows/deploy-production.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-production.yml@main
     with:
       registry: ghcr.io
       image-owner: ${{ github.repository_owner }}
@@ -104,7 +104,7 @@ jobs:
     name: Continuous Monitoring
     needs: deploy-prod
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: DEBARPAN2000/CI-CD/.github/workflows/continuous-monitoring.yml@main
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/continuous-monitoring.yml@main
     with:
       registry: ghcr.io
       image-owner: ${{ github.repository_owner }}

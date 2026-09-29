@@ -81,7 +81,7 @@ A reusable, enterprise-grade GitHub Actions CI/CD template for .NET and Python a
 
 1. **Clone and configure**:
    ```bash
-   git clone https://github.com/DEBARPAN2000/CI-CD.git
+   git clone https://github.com/debarpan-bose-chowdhury/CI-CD.git
    cd CI-CD
    ```
 
@@ -113,7 +113,7 @@ cp examples/python-consumer-workflow.yml .github/workflows/ci-cd-pipeline.yml
 ```
 
 #### Step 2: Update Workflow References
-Replace `DEBARPAN2000` with your organization:
+Replace `debarpan-bose-chowdhury` with your organization:
 ```yaml
 uses: YOUR-ORG/CI-CD/.github/workflows/ci.yml@main
 ```
@@ -466,7 +466,7 @@ Push changes to `main` branch. Consumer repos will automatically use latest via 
 
 To use a specific version:
 ```yaml
-uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@v1.0.0
+uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@v1.0.0
 ```
 
 ### Contributing Improvements

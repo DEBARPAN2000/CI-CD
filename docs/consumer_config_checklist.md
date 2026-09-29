@@ -84,7 +84,7 @@ Each consuming repository must complete these steps to use the CI/CD template.
       branches: [main]
   jobs:
     call-ci:
-      uses: DEBARPAN2000/CI-CD/.github/workflows/ci.yml@<tag-or-branch>
+      uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@<tag-or-branch>
       with:
         language: auto  # or 'dotnet', 'python'
         sonar-project-key: <your-org>-<repo-name>
@@ -99,7 +99,7 @@ Each consuming repository must complete these steps to use the CI/CD template.
       branches: [main]
   jobs:
     call-docker:
-      uses: DEBARPAN2000/CI-CD/.github/workflows/docker-build-push.yml@<tag-or-branch>
+      uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/docker-build-push.yml@<tag-or-branch>
       with:
         image-owner: ${{ github.repository_owner }}
         image-name: ${{ github.event.repository.name }}
@@ -117,7 +117,7 @@ Each consuming repository must complete these steps to use the CI/CD template.
       types: [completed]
   jobs:
     call-deploy:
-      uses: DEBARPAN2000/CI-CD/.github/workflows/deploy-staging.yml@<tag-or-branch>
+      uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-staging.yml@<tag-or-branch>
       with:
         environment-name: staging
         registry: ghcr.io
@@ -134,7 +134,7 @@ Each consuming repository must complete these steps to use the CI/CD template.
       types: [completed]
   jobs:
     call-dast:
-      uses: DEBARPAN2000/CI-CD/.github/workflows/dast-smoke.yml@<tag-or-branch>
+      uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/dast-smoke.yml@<tag-or-branch>
       with:
         staging-url: https://staging.example.com
         smoke-test-endpoint: /health
@@ -154,7 +154,7 @@ Each consuming repository must complete these steps to use the CI/CD template.
         - run: echo "Manual approval required before prod deploy"
     call-deploy:
       needs: approval
-      uses: DEBARPAN2000/CI-CD/.github/workflows/deploy-production.yml@<tag-or-branch>
+      uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-production.yml@<tag-or-branch>
       with:
         environment-name: production
         image-tag: ${{ needs.approval.outputs.approved-tag }}
