@@ -14,6 +14,20 @@ on:
         type: string
         default: /health
         description: 'Comma-separated list of endpoints to smoke-test'
+      image-ref:
+        type: string
+        default: ''
+        description: 'If set, the app is started from this image via compose before scanning (needed when the target is not already reachable from this runner)'
+      compose-file:
+        type: string
+        default: docker-compose.staging.yml
+      compose-service:
+        type: string
+        default: app
+      tls-cert:
+        type: boolean
+        default: false
+        description: 'Generate ./certs/{cert,key}.pem for HTTPS apps'
     secrets:
       DAST_USERNAME:
         required: false
@@ -21,12 +35,40 @@ on:
         required: false
 
 jobs:
-  smoke-test:
+  dast:
     runs-on: ubuntu-latest
-    name: Smoke Tests
+    name: Smoke Tests and DAST (OWASP ZAP)
     permissions:
       contents: read
+      packages: read
+      security-events: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Create local TLS certificate
+        if: ${{ inputs.tls-cert }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certs
+          openssl req -x509 -nodes -days 1 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem \
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          chmod 644 certs/key.pem certs/cert.pem
+
+      - name: Start app
+        if: ${{ inputs.image-ref != '' }}
+        shell: bash
+        env:
+          IMAGE_REF: ${{ inputs.image-ref }}
+          COMPOSE_FILE: ${{ inputs.compose-file }}
+          COMPOSE_SERVICE: ${{ inputs.compose-service }}
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE_REF"
+          docker compose -f "$COMPOSE_FILE" down || true
+          docker compose -f "$COMPOSE_FILE" up -d "$COMPOSE_SERVICE"
+
       - name: Test health endpoints
         shell: bash
         env:
@@ -37,7 +79,7 @@ jobs:
 
           echo "Waiting for ${TARGET_URL} to be responsive..."
           for i in $(seq 1 12); do
-            if curl -fsS "${TARGET_URL}/health" >/dev/null 2>&1; then
+            if curl -fsSk "${TARGET_URL}/health" >/dev/null 2>&1; then
               echo "✓ Target is responsive"
               break
             fi
@@ -64,7 +106,7 @@ jobs:
             fi
 
             echo "Testing ${endpoint}..."
-            response_code="$(curl -sS -o /dev/null -w '%{http_code}' "${TARGET_URL}${endpoint}")"
+            response_code="$(curl -sSk -o /dev/null -w '%{http_code}' "${TARGET_URL}${endpoint}")"
             if [ "${response_code}" -ge 200 ] && [ "${response_code}" -lt 400 ]; then
               echo "  ✓ ${endpoint}: HTTP ${response_code}"
             else
@@ -72,14 +114,6 @@ jobs:
               exit 1
             fi
           done
-
-  dast-scan:
-    runs-on: ubuntu-latest
-    name: DAST (OWASP ZAP)
-    permissions:
-      security-events: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Run OWASP ZAP scan
         shell: bash
@@ -89,18 +123,12 @@ jobs:
           set -euo pipefail
           echo "Starting OWASP ZAP scan of ${TARGET_URL}..."
 
-          docker run --rm \
-            -v "$PWD:/zap/wrk" \
-            -e TARGET_URL \
-            -e ZAP_OPTS="-config api.disablekey=true" \
-            ghcr.io/zaproxy/zaproxy:stable \
-            bash -lc '
-              set -euo pipefail
-              echo "Running baseline scan..."
-              zap-baseline.py -t "$TARGET_URL" -J /zap/wrk/baseline-report.json || true
-              echo "Running full scan..."
-              zap-full-scan.py -t "$TARGET_URL" -J /zap/wrk/zap-report.json -r /zap/wrk/zap-report.html || true
-            '
+          # --network host lets ZAP reach an app published on the runner's localhost.
+          # Call the scripts directly (no login shell: `bash -lc` resets PATH and hides /zap/*.py).
+          # Scan findings are gated by the "Parse and gate on findings" step, so scan exit codes are ignored.
+          zap() { docker run --rm --network host --user root -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable "$@" || true; }
+          zap zap-baseline.py -t "$TARGET_URL" -J baseline-report.json
+          zap zap-full-scan.py -t "$TARGET_URL" -T 10 -J zap-report.json -r zap-report.html
 
           cat > /tmp/zap_to_sarif.py <<'PY'
           import json
@@ -210,7 +238,7 @@ jobs:
           THRESHOLD="${THRESHOLD}" python3 /tmp/check_zap_threshold.py
 
       - name: Upload to GitHub Security
-        if: always()
+        if: ${{ always() && hashFiles('zap-report.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938
         with:
           sarif_file: zap-report.sarif

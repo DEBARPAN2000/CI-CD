@@ -1,4 +1,4 @@
-﻿name: Reusable Deploy Staging
+name: Reusable Deploy Staging
 
 on:
   workflow_call:
@@ -36,6 +36,10 @@ on:
       health-check-delay:
         type: string
         default: '10'
+      tls-cert:
+        type: boolean
+        default: false
+        description: 'Generate ./certs/{cert,key}.pem for compose files that mount them (HTTPS apps)'
 
 permissions:
   contents: read
@@ -101,6 +105,17 @@ jobs:
           set -euo pipefail
           docker pull '${{ steps.resolve-image.outputs.image-ref }}' || exit 1
 
+      - name: Create local TLS certificate
+        if: ${{ inputs.tls-cert }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certs
+          openssl req -x509 -nodes -days 1 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem \
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          # container runs as a non-root user; the certs are throwaway, so make them world-readable
+          chmod 644 certs/key.pem certs/cert.pem
+
       - name: Deploy via Docker Compose
         shell: bash
         run: |
@@ -128,7 +143,7 @@ jobs:
 
           for i in $(seq 1 "$max_retries"); do
             echo "[${i}/${max_retries}] Checking health: ${url}"
-            if curl -sf "$url" >/dev/null 2>&1; then
+            if curl -ksf "$url" >/dev/null 2>&1; then
               echo "✓ Health check passed"
               exit 0
             fi
