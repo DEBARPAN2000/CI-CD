@@ -121,6 +121,7 @@ jobs:
         shell: bash
         env:
           TARGET_URL: ${{ inputs.target-url }}
+          LOCATION_URI: ${{ inputs.compose-file }}
         run: |
           set -euo pipefail
           echo "Starting OWASP ZAP scan of ${TARGET_URL}..."
@@ -135,9 +136,12 @@ jobs:
 
           cat > /tmp/zap_to_sarif.py <<'PY'
           import json
+          import os
           import sys
 
           target_url = sys.argv[1]
+          # Code scanning needs a repo-relative file; anchor findings to the deployment file.
+          location_uri = os.environ['LOCATION_URI']
 
           with open('zap-report.json', 'r', encoding='utf-8') as f:
               zap_data = json.load(f)
@@ -160,12 +164,11 @@ jobs:
               severity_map = {0: 'note', 1: 'warning', 2: 'error', 3: 'error', 4: 'error'}
               result = {
                   'ruleId': str(alert.get('pluginid', 'unknown')),
-                  'message': {'text': alert.get('name', 'Unknown Alert')},
+                  'message': {'text': f"{alert.get('name', 'Unknown Alert')} ({target_url})"},
                   'level': severity_map.get(risk_code, 'warning'),
                   'locations': [{
                       'physicalLocation': {
-                          'artifactLocation': {'uri': target_url},
-                          'address': {'uri': target_url}
+                          'artifactLocation': {'uri': location_uri}
                       }
                   }]
               }
