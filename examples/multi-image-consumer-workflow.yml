@@ -1,0 +1,147 @@
+name: Example Multi-Image Consumer Pipeline
+
+# One repository, several images, mixed languages:
+#   - api     (.NET, service)  deployed behind a health check
+#   - web     (Python, service) deployed behind a health check
+#   - worker  (Python, batch)   built, smoke-run and scanned, never deployed
+#
+# The same `images` JSON is passed to every reusable workflow (job-level `with:` cannot read `env`,
+# so the array is repeated). Each workflow uses the parts it needs:
+#   docker-build-push  -> builds every image, smoke-runs batch images that set smoke-command
+#   deploy-*, dast     -> only role=service images, together in ONE compose stack
+#   monitoring         -> only role=service images, each at its own health-url
+#   image-periodic-scan-> takes a plain JSON array of image paths (see the scan job below)
+#
+# Your compose file receives IMAGE_REF_<NAME> per service (name upper-cased, non-alphanumerics -> "_"):
+#   services:
+#     api:    { image: "${IMAGE_REF_API}", ... }
+#     web:    { image: "${IMAGE_REF_WEB}", ... }
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+  deployments: write
+  security-events: write
+  packages: write
+
+jobs:
+  ci:
+    name: CI (mixed)
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/ci.yml@main
+    with:
+      language: both
+      python-test-command: 'pytest'
+
+  build-docker:
+    name: Build Docker Images
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/docker-build-push.yml@main
+    with:
+      registry: ghcr.io
+      image-owner: ${{ github.repository_owner }}
+      image-tag: ${{ github.sha }}
+      images: >-
+        [
+          {"name": "api", "language": "dotnet", "role": "service", "compose-service": "api",
+           "health-url": "http://localhost:8081/health"},
+          {"name": "web", "language": "python", "role": "service", "compose-service": "web",
+           "dockerfile": "web/Dockerfile", "context": "web", "health-url": "http://localhost:8082/health"},
+          {"name": "worker", "language": "python", "role": "batch",
+           "dockerfile": "worker/Dockerfile", "context": "worker",
+           "smoke-command": "python -m worker --check", "build-args": {"WORKER_MODE": "batch"}}
+        ]
+    secrets:
+      REGISTRY_USERNAME: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-docker
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-staging.yml@main
+    with:
+      registry: ghcr.io
+      image-owner: ${{ github.repository_owner }}
+      image-tag: ${{ github.sha }}
+      environment-name: staging
+      compose-file: docker-compose.staging.yml
+      images: >-
+        [
+          {"name": "api", "role": "service", "compose-service": "api", "health-url": "http://localhost:8081/health"},
+          {"name": "web", "role": "service", "compose-service": "web", "health-url": "http://localhost:8082/health"},
+          {"name": "worker", "role": "batch"}
+        ]
+
+  dast-scan:
+    name: DAST Security Scan
+    needs: deploy-staging
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/dast-smoke.yml@main
+    with:
+      target-url: http://localhost:8082
+      smoke-endpoints: /health
+      registry: ghcr.io
+      image-owner: ${{ github.repository_owner }}
+      image-tag: ${{ github.sha }}
+      compose-file: docker-compose.staging.yml
+      images: >-
+        [
+          {"name": "api", "role": "service", "compose-service": "api"},
+          {"name": "web", "role": "service", "compose-service": "web"}
+        ]
+
+  approval:
+    name: Manual Approval for Production
+    needs: dast-scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production-approval
+    steps:
+      - run: echo "✓ Approved for production"
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: [build-docker, approval]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/deploy-production.yml@main
+    with:
+      registry: ghcr.io
+      image-owner: ${{ github.repository_owner }}
+      image-tag: ${{ github.sha }}
+      environment-name: production
+      compose-file: docker-compose.yml
+      images: >-
+        [
+          {"name": "api", "role": "service", "compose-service": "api", "health-url": "http://localhost:8081/health"},
+          {"name": "web", "role": "service", "compose-service": "web", "health-url": "http://localhost:8082/health"}
+        ]
+
+  monitor:
+    name: Continuous Monitoring
+    needs: deploy-prod
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/continuous-monitoring.yml@main
+    with:
+      registry: ghcr.io
+      image-owner: ${{ github.repository_owner }}
+      image-tag: ${{ github.sha }}
+      images: >-
+        [
+          {"name": "api", "role": "service", "health-url": "http://localhost:8081/health"},
+          {"name": "web", "role": "service", "health-url": "http://localhost:8082/health"}
+        ]
+
+  # Typically lives in its own scheduled workflow (on: schedule / workflow_dispatch).
+  periodic-scan:
+    name: Periodic Image Scan
+    needs: build-docker
+    uses: debarpan-bose-chowdhury/CI-CD/.github/workflows/image-periodic-scan.yml@main
+    with:
+      images: '["${{ github.repository_owner }}/api", "${{ github.repository_owner }}/web", "${{ github.repository_owner }}/worker"]'
+      tags-to-scan: '["latest"]'

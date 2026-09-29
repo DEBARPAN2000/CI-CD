@@ -108,6 +108,9 @@ Each consuming repository must complete these steps to use the CI/CD template.
         registry-username: ${{ secrets.REGISTRY_USERNAME }}
         registry-password: ${{ secrets.REGISTRY_PASSWORD }}
   ```
+- [ ] (Multi-image repos) Instead of one call per image, pass an `images` JSON array to `docker-build-push.yml`,
+      `deploy-*.yml`, `dast-smoke.yml` and `continuous-monitoring.yml`, and use `IMAGE_REF_<NAME>` in your
+      compose files. See `examples/multi-image-consumer-workflow.yml` and the README section "Multi-image pipelines".
 - [ ] Create `call-deploy-staging.yml`
   ```yaml
   name: Deploy to Staging

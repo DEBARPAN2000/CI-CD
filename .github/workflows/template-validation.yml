@@ -269,10 +269,39 @@ jobs:
           
           echo "✓ Docker images properly structured"
 
+  test-multi-image:
+    name: Test Multi-Image Support
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install PyYAML
+        shell: bash
+        run: |
+          python3 -m pip install --only-binary :all: --disable-pip-version-check -q "pyyaml==6.0.2"
+
+      - name: Run multi-image resolve tests
+        shell: bash
+        run: bash tests/multi-image/run.sh
+
+      - name: Validate multi-image example workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, yaml
+          wf = yaml.safe_load(open('examples/multi-image-consumer-workflow.yml'))
+          for name, job in wf['jobs'].items():
+              images = job.get('with', {}).get('images')
+              if images:
+                  json.loads(images)
+                  print(f"  ✓ {name}: images is valid JSON")
+          PY
+
   final-check:
     name: Final Integration Check
     runs-on: ubuntu-latest
-    needs: [validate-workflows, lint-dockerfiles, test-dotnet-workflow, test-python-workflow, check-documentation, integration-test]
+    needs: [validate-workflows, lint-dockerfiles, test-dotnet-workflow, test-python-workflow, test-multi-image, check-documentation, integration-test]
     if: always()
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -287,6 +316,7 @@ jobs:
           echo "- Dockerfiles: ${{ needs.lint-dockerfiles.result }}"
           echo ".NET Workflow: ${{ needs.test-dotnet-workflow.result }}"
           echo "- Python Workflow: ${{ needs.test-python-workflow.result }}"
+          echo "- Multi-Image: ${{ needs.test-multi-image.result }}"
           echo "- Documentation: ${{ needs.check-documentation.result }}"
           echo "- Integration Tests: ${{ needs.integration-test.result }}"
           echo ""
@@ -295,6 +325,7 @@ jobs:
              [ "${{ needs.lint-dockerfiles.result }}" = "success" ] && \
              [ "${{ needs.test-dotnet-workflow.result }}" = "success" ] && \
              [ "${{ needs.test-python-workflow.result }}" = "success" ] && \
+             [ "${{ needs.test-multi-image.result }}" = "success" ] && \
              [ "${{ needs.check-documentation.result }}" = "success" ] && \
              [ "${{ needs.integration-test.result }}" = "success" ]; then
             echo "✓ All validation checks passed!"

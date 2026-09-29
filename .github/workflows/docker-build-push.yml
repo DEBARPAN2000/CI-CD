@@ -30,6 +30,15 @@ on:
       python-version:
         type: string
         default: '3.12'
+      images:
+        type: string
+        default: ''
+        description: >-
+          JSON array describing several images to build in one run (see README, "Multi-image pipelines").
+          Fields per entry: name (required), language (python|dotnet, required unless dockerfile is set),
+          dockerfile, context, role (service|batch, default batch), smoke-command (batch only),
+          compose-service, health-url (service only), build-args (map). When empty, the single-image
+          inputs above are used exactly as before.
       tag-latest:
         type: boolean
         default: true
@@ -41,105 +50,178 @@ on:
         required: true
     outputs:
       image-ref:
+        description: 'Reference of the last image to finish building; only reliable in single-image mode'
         value: ${{ jobs.build.outputs.image-ref }}
       image-digest:
+        description: 'Digest of the last image to finish building; only reliable in single-image mode'
         value: ${{ jobs.build.outputs.image-digest }}
       detected-language:
+        description: 'Language of the image, or comma-separated languages when several images are built'
         value: ${{ jobs.detect.outputs.language }}
+      image-names:
+        description: 'JSON array of the image names built'
+        value: ${{ jobs.detect.outputs.names }}
 
 permissions:
   contents: read
   packages: write
 
 jobs:
+  # Turns either the `images` input or the legacy single-image inputs into one build matrix.
+  # The matrix deliberately holds no registry owner / full image reference: Actions drops job outputs
+  # that contain a masked secret value (e.g. a REGISTRY_USERNAME equal to the owner), so references are
+  # rebuilt inside each job from the image name instead.
   detect:
     runs-on: ubuntu-latest
     outputs:
       language: ${{ steps.detect.outputs.language }}
-      dockerfile: ${{ steps.detect.outputs.dockerfile }}
+      names: ${{ steps.detect.outputs.names }}
+      images: ${{ steps.detect.outputs.images }}
+      smoke: ${{ steps.detect.outputs.smoke }}
+      has-smoke: ${{ steps.detect.outputs.has-smoke }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - if: ${{ inputs.dockerfile-path == '' }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          repository: ${{ github.repository_owner }}/CI-CD
-          path: .ci-cd-templates
       - id: detect
+        name: Resolve images
         shell: bash
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+          LANGUAGE: ${{ inputs.language }}
+          DOCKERFILE: ${{ inputs.dockerfile-path }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          BUILD_CONTEXT: ${{ inputs.build-context }}
+          DOTNET_VERSION: ${{ inputs.dotnet-version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
-          language='${{ inputs.language }}'
-          dockerfile='${{ inputs.dockerfile-path }}'
-          dotnet='false'
-          python='false'
+          templates='.ci-cd-templates/docker'
 
-          if [ "$language" = 'dotnet' ]; then
-            dotnet='true'
-          elif [ "$language" = 'python' ]; then
-            python='true'
-          elif [ "$language" = 'both' ]; then
-            dotnet='true'
-            python='true'
-          else
-            if find . \( -name '*.sln' -o -name '*.csproj' -o -name 'global.json' -o -name 'Directory.Build.props' \) | grep -q .; then
+          if [ -z "$IMAGES_INPUT" ]; then
+            # Single-image mode: same language detection and Dockerfile selection as before.
+            language="$LANGUAGE"
+            dockerfile="$DOCKERFILE"
+            dotnet='false'
+            python='false'
+
+            if [ "$language" = 'dotnet' ]; then
               dotnet='true'
-            fi
-            if find . \( -name 'pyproject.toml' -o -name 'requirements*.txt' -o -name 'setup.py' -o -name 'setup.cfg' \) | grep -q .; then
+            elif [ "$language" = 'python' ]; then
               python='true'
-            fi
-          fi
-
-          if [ -z "$dockerfile" ]; then
-            if [ "$dotnet" = 'true' ]; then
-              dockerfile='.ci-cd-templates/docker/Dockerfile.dotnet'
-              language='dotnet'
-            elif [ "$python" = 'true' ]; then
-              dockerfile='.ci-cd-templates/docker/Dockerfile.python'
-              language='python'
+            elif [ "$language" = 'both' ]; then
+              dotnet='true'
+              python='true'
             else
-              echo 'Unable to detect a supported stack.' >&2
-              exit 1
+              if find . \( -name '*.sln' -o -name '*.csproj' -o -name 'global.json' -o -name 'Directory.Build.props' \) | grep -q .; then
+                dotnet='true'
+              fi
+              if find . \( -name 'pyproject.toml' -o -name 'requirements*.txt' -o -name 'setup.py' -o -name 'setup.cfg' \) | grep -q .; then
+                python='true'
+              fi
             fi
+
+            if [ -z "$dockerfile" ]; then
+              if [ "$dotnet" = 'true' ]; then
+                language='dotnet'
+              elif [ "$python" = 'true' ]; then
+                language='python'
+              else
+                echo 'Unable to detect a supported stack.' >&2
+                exit 1
+              fi
+            elif [ "$language" != 'dotnet' ] && [ "$language" != 'python' ]; then
+              if [ "$dotnet" = 'true' ]; then language='dotnet'; elif [ "$python" = 'true' ]; then language='python'; fi
+            fi
+
+            entry=$(jq -cn --arg name "${IMAGE_NAME:-$REPO_NAME}" --arg language "$language" --arg dockerfile "$dockerfile" \
+              '[{name: $name, language: $language} + (if $dockerfile != "" then {dockerfile: $dockerfile} else {} end)]')
+            images_in="$entry"
+          else
+            images_in="$IMAGES_INPUT"
           fi
 
-          echo "language=$language" >> "$GITHUB_OUTPUT"
-          echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+          # Normalise and validate every entry.
+          images=$(printf '%s' "$images_in" | jq -c \
+            --arg templates "$templates" --arg context "$BUILD_CONTEXT" \
+            --arg dotnet "$DOTNET_VERSION" --arg python "$PYTHON_VERSION" '
+            if type != "array" or length == 0 then error("images must be a non-empty JSON array") else . end
+            | map(
+                ((.name // "") | ascii_downcase) as $name
+                | (.role // "batch") as $role
+                | (.language // "") as $language
+                | (.dockerfile // "") as $dockerfile
+                | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                | if ($role == "service" or $role == "batch") | not then error("image " + $name + ": role must be service or batch") else . end
+                | if $dockerfile == "" and ($language != "python" and $language != "dotnet")
+                    then error("image " + $name + ": set language (python|dotnet) or dockerfile") else . end
+                | if $role == "service" and ((.["smoke-command"] // "") != "") then error("image " + $name + ": smoke-command is only supported for role batch") else . end
+                | {
+                    name: $name,
+                    key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")),
+                    language: (if $language == "python" or $language == "dotnet" then $language else "custom" end),
+                    dockerfile: (if $dockerfile != "" then $dockerfile else ($templates + "/Dockerfile." + $language) end),
+                    context: (.context // $context),
+                    role: $role,
+                    "smoke-command": (.["smoke-command"] // ""),
+                    "needs-templates": ($dockerfile == ""),
+                    "build-args": (
+                      ({DOTNET_VERSION: $dotnet, PYTHON_VERSION: $python} + (.["build-args"] // {}))
+                      | to_entries | map(.key + "=" + (.value | tostring)) | join("\n"))
+                  })
+            | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+
+          smoke=$(printf '%s' "$images" | jq -c 'map(select(.role == "batch" and .["smoke-command"] != ""))')
+
+          {
+            echo "images=$images"
+            echo "smoke=$smoke"
+            echo "has-smoke=$(printf '%s' "$smoke" | jq 'length > 0')"
+            echo "names=$(printf '%s' "$images" | jq -c 'map(.name)')"
+            echo "language=$(printf '%s' "$images" | jq -r 'map(.language) | unique | join(",")')"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "$images" | jq -r '.[] | "  - \(.name) [\(.role), \(.language)] \(.dockerfile)"'
 
   build:
+    name: Build ${{ matrix.name }}
     needs: detect
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.images) }}
     outputs:
       image-ref: ${{ steps.meta.outputs.image-ref }}
       image-digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - if: ${{ inputs.dockerfile-path == '' }}
+      - if: ${{ matrix.needs-templates }}
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: ${{ github.repository_owner }}/CI-CD
           path: .ci-cd-templates
       - id: meta
         shell: bash
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          image_name='${{ inputs.image-name }}'
-          if [ -z "$image_name" ]; then
-            image_name='${{ github.event.repository.name }}'
-          fi
-          registry='${{ inputs.registry }}'
-          registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-          image_owner='${{ inputs.image-owner }}'
+          registry=$(printf '%s' "$REGISTRY" | tr '[:upper:]' '[:lower:]')
+          image_owner="$IMAGE_OWNER"
           if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
-            image_owner='${{ github.repository_owner }}'
+            image_owner="$REPO_OWNER"
           fi
-          image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
+          image_name=$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
           image_path="$image_name"
           if [ -n "$image_owner" ]; then
             image_path="${image_owner}/$image_name"
           fi
           echo "image-base=${registry}/$image_path" >> "$GITHUB_OUTPUT"
-          echo "image-ref=${registry}/$image_path:${{ inputs.image-tag }}" >> "$GITHUB_OUTPUT"
+          echo "image-ref=${registry}/$image_path:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "image-name=$image_name" >> "$GITHUB_OUTPUT"
       - name: Login to registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
@@ -151,8 +233,8 @@ jobs:
       - id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: ${{ inputs.build-context }}
-          file: ${{ needs.detect.outputs.dockerfile }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: |
             ${{ steps.meta.outputs.image-ref }}
@@ -160,8 +242,52 @@ jobs:
           provenance: true
           sbom: true
           platforms: linux/amd64,linux/arm64
-          build-args: |
-            DOTNET_VERSION=${{ inputs.dotnet-version }}
-            PYTHON_VERSION=${{ inputs.python-version }}
+          build-args: ${{ matrix.build-args }}
           cache-from: type=registry,ref=${{ steps.meta.outputs.image-base }}:buildcache
           cache-to: type=registry,ref=${{ steps.meta.outputs.image-base }}:buildcache,mode=max
+
+  # Runs each batch image's smoke-command once, from the image that was just pushed.
+  smoke:
+    name: Smoke run ${{ matrix.name }}
+    needs: [detect, build]
+    if: ${{ needs.detect.outputs.has-smoke == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.smoke) }}
+    steps:
+      - name: Login to registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+      - name: Run smoke command
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          SMOKE_COMMAND: ${{ matrix.smoke-command }}
+          REGISTRY: ${{ inputs.registry }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          registry=$(printf '%s' "$REGISTRY" | tr '[:upper:]' '[:lower:]')
+          image_owner="$IMAGE_OWNER"
+          if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
+            image_owner="$REPO_OWNER"
+          fi
+          image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
+          image_path="$IMAGE_NAME"
+          if [ -n "$image_owner" ]; then
+            image_path="${image_owner}/$image_path"
+          fi
+          image_ref="${registry}/${image_path}:${IMAGE_TAG}"
+
+          docker pull "$image_ref"
+          # The command is passed as the container's arguments (replacing CMD, appended to any ENTRYPOINT).
+          read -r -a cmd <<< "$SMOKE_COMMAND"
+          echo "Running: docker run --rm $image_ref ${cmd[*]}"
+          docker run --rm "$image_ref" "${cmd[@]}"

@@ -3,6 +3,13 @@ name: Reusable Continuous Monitoring
 on:
   workflow_call:
     inputs:
+      images:
+        type: string
+        default: ''
+        description: >-
+          JSON array of images (same schema as docker-build-push.yml). Every entry with role "service" is
+          monitored at its own health-url (health, compliance and synthetic checks run once per service).
+          Empty = single-image mode using image-ref/image-name and monitoring-url.
       image-ref:
         type: string
         default: ''
@@ -21,6 +28,7 @@ on:
       monitoring-url:
         type: string
         default: 'http://localhost/health'
+        description: 'Single-image mode only; in multi-image mode use health-url per images entry'
       check-interval:
         type: string
         default: '60'
@@ -37,53 +45,126 @@ on:
         required: false
 
 jobs:
+  # Lists what to monitor. Only names and URLs are passed on: job outputs holding registry owners
+  # can be dropped by Actions when they match a secret, so image references are built inside each job.
+  resolve:
+    runs-on: ubuntu-latest
+    name: Resolve monitored services
+    outputs:
+      services: ${{ steps.resolve.outputs.services }}
+    steps:
+      - id: resolve
+        shell: bash
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          MONITORING_URL: ${{ inputs.monitoring-url }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$IMAGES_INPUT" ]; then
+            services=$(printf '%s' "$IMAGES_INPUT" | jq -c '
+              if type != "array" then error("images must be a JSON array") else . end
+              | map(select((.role // "batch") == "service")
+                  | ((.name // "") | ascii_downcase) as $name
+                  | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                  | if (.["health-url"] // "") == "" then error("service image " + $name + " needs a health-url") else . end
+                  | {name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), url: .["health-url"]})
+              | if length == 0 then error("images contains no role=service entry") else . end
+              | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+          else
+            name=$(printf '%s' "${IMAGE_NAME:-$REPO_NAME}" | tr '[:upper:]' '[:lower:]')
+            services=$(jq -cn --arg name "$name" --arg url "$MONITORING_URL" \
+              '[{name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), url: $url}]')
+          fi
+          echo "services=$services" >> "$GITHUB_OUTPUT"
+          printf '%s' "$services" | jq -r '.[] | "  - \(.name): \(.url)"'
+
   health-monitoring:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.resolve.outputs.services) }}
     permissions:
       contents: read
       deployments: write
     runs-on: ubuntu-latest
-    name: Runtime Health Monitoring
+    name: Runtime Health Monitoring (${{ matrix.service.name }})
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Resolve image reference
+      - name: Resolve image references
         id: resolve-image
         shell: bash
+        env:
+          IMAGES_INPUT: ''
+          IMAGE_REF: ${{ inputs.images == '' && inputs.image-ref || '' }}
+          IMAGE_NAME: ${{ matrix.service.name }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
+          COMPOSE_SERVICE: app
+          HEALTH_URL: ${{ matrix.service.url }}
+          REQUIRE_HEALTH: 'false'
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          image_ref='${{ inputs.image-ref }}'
-          if [ -z "$image_ref" ]; then
-            image_name='${{ inputs.image-name }}'
-            if [ -z "$image_name" ]; then
-              image_name='${{ github.event.repository.name }}'
-            fi
-            image_tag='${{ inputs.image-tag }}'
-            if [ -z "$image_tag" ]; then
-              image_tag='${{ github.sha }}'
-            fi
-            registry='${{ inputs.registry }}'
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_owner='${{ inputs.image-owner }}'
-            if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
-              image_owner='${{ github.repository_owner }}'
-            fi
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_path="$image_name"
-            if [ -n "$image_owner" ]; then
-              image_path="${image_owner}/$image_name"
-            fi
-            image_ref="${registry}/${image_path}:$image_tag"
-          else
-            registry="${image_ref%%/*}"
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          registry=$(lower "$REGISTRY")
+          owner="$IMAGE_OWNER"
+          if [ -z "$owner" ] && [ "$registry" = 'ghcr.io' ]; then
+            owner="$REPO_OWNER"
           fi
-          echo "image-ref=$image_ref" >> "$GITHUB_OUTPUT"
-          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          owner=$(lower "$owner")
+          tag="${IMAGE_TAG:-$SHA}"
+
+          if [ -n "$IMAGES_INPUT" ]; then
+            # Multi-image mode: every role=service entry becomes one deployable service.
+            services=$(printf '%s' "$IMAGES_INPUT" | jq -c \
+              --arg registry "$registry" --arg owner "$owner" --arg tag "$tag" --arg require_health "$REQUIRE_HEALTH" '
+              if type != "array" then error("images must be a JSON array") else . end
+              | map(select((.role // "batch") == "service")
+                  | ((.name // "") | ascii_downcase) as $name
+                  | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                  | {
+                      name: $name,
+                      key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")),
+                      ref: ($registry + "/" + (if $owner != "" then $owner + "/" else "" end) + $name + ":" + $tag),
+                      registry: $registry,
+                      service: (.["compose-service"] // $name),
+                      health: (.["health-url"] // "")
+                    }
+                  | if $require_health == "true" and .health == "" then error("service image " + .name + " needs a health-url") else . end)
+              | if length == 0 then error("images contains no role=service entry") else . end
+              | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+          else
+            # Single-image mode: one service, exactly as before.
+            if [ -n "$IMAGE_REF" ]; then
+              image_ref="$IMAGE_REF"
+              registry=$(lower "${image_ref%%/*}")
+            else
+              image_name=$(lower "${IMAGE_NAME:-$REPO_NAME}")
+              image_path="$image_name"
+              if [ -n "$owner" ]; then
+                image_path="${owner}/$image_name"
+              fi
+              image_ref="${registry}/${image_path}:${tag}"
+            fi
+            services=$(jq -cn --arg name "$(lower "${IMAGE_NAME:-$REPO_NAME}")" --arg ref "$image_ref" --arg registry "$registry" \
+              --arg service "$COMPOSE_SERVICE" --arg health "$HEALTH_URL" \
+              '[{name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), ref: $ref, registry: $registry, service: $service, health: $health}]')
+          fi
+
+          {
+            echo "services=$services"
+            echo "ghcr=$(printf '%s' "$services" | jq 'any(.[]; .registry == "ghcr.io")')"
+            # First service's ref; keeps single-image consumers working (outputs may be dropped if they match a secret).
+            echo "image-ref=$(printf '%s' "$services" | jq -r '.[0].ref')"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "$services" | jq -r '.[] | "  - \(.name) -> \(.ref) (compose service: \(.service))"'
 
       - name: Perform health checks
         id: health
@@ -91,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          url='${{ inputs.monitoring-url }}'
+          url='${{ matrix.service.url }}'
           max_checks=${{ inputs.max-checks }}
           interval=${{ inputs.check-interval }}
           check_count=0
@@ -135,7 +216,7 @@ jobs:
           # Runtime Monitoring Report
 
           **Image**: ${{ steps.resolve-image.outputs.image-ref }}
-          **URL**: ${{ inputs.monitoring-url }}
+          **URL**: ${{ matrix.service.url }}
           **Timestamp**: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
           ## Health Checks
@@ -149,7 +230,7 @@ jobs:
           - Error rate: 0%
 
           ## Endpoints Monitored
-          - `${{ inputs.monitoring-url }}`
+          - `${{ matrix.service.url }}`
 
           ## Alerts
           None
@@ -165,53 +246,95 @@ jobs:
       - name: Upload monitoring report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: monitoring-report
+          name: monitoring-report-${{ matrix.service.key }}
           path: monitoring-report.md
           retention-days: 30
 
   compliance-check:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.resolve.outputs.services) }}
     runs-on: ubuntu-latest
-    name: Container Compliance Check
+    name: Container Compliance Check (${{ matrix.service.name }})
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Resolve image reference
+      - name: Resolve image references
         id: resolve-image
         shell: bash
+        env:
+          IMAGES_INPUT: ''
+          IMAGE_REF: ${{ inputs.images == '' && inputs.image-ref || '' }}
+          IMAGE_NAME: ${{ matrix.service.name }}
+          IMAGE_OWNER: ${{ inputs.image-owner }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          REGISTRY: ${{ inputs.registry }}
+          COMPOSE_SERVICE: app
+          HEALTH_URL: ${{ matrix.service.url }}
+          REQUIRE_HEALTH: 'false'
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          image_ref='${{ inputs.image-ref }}'
-          if [ -z "$image_ref" ]; then
-            image_name='${{ inputs.image-name }}'
-            if [ -z "$image_name" ]; then
-              image_name='${{ github.event.repository.name }}'
-            fi
-            image_tag='${{ inputs.image-tag }}'
-            if [ -z "$image_tag" ]; then
-              image_tag='${{ github.sha }}'
-            fi
-            registry='${{ inputs.registry }}'
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-            image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            image_owner='${{ inputs.image-owner }}'
-            if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
-              image_owner='${{ github.repository_owner }}'
-            fi
-            image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            image_path="$image_name"
-            if [ -n "$image_owner" ]; then
-              image_path="${image_owner}/$image_name"
-            fi
-            image_ref="${registry}/${image_path}:$image_tag"
-          else
-            registry="${image_ref%%/*}"
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          registry=$(lower "$REGISTRY")
+          owner="$IMAGE_OWNER"
+          if [ -z "$owner" ] && [ "$registry" = 'ghcr.io' ]; then
+            owner="$REPO_OWNER"
           fi
-          echo "image-ref=$image_ref" >> "$GITHUB_OUTPUT"
-          echo "registry=$registry" >> "$GITHUB_OUTPUT"
+          owner=$(lower "$owner")
+          tag="${IMAGE_TAG:-$SHA}"
+
+          if [ -n "$IMAGES_INPUT" ]; then
+            # Multi-image mode: every role=service entry becomes one deployable service.
+            services=$(printf '%s' "$IMAGES_INPUT" | jq -c \
+              --arg registry "$registry" --arg owner "$owner" --arg tag "$tag" --arg require_health "$REQUIRE_HEALTH" '
+              if type != "array" then error("images must be a JSON array") else . end
+              | map(select((.role // "batch") == "service")
+                  | ((.name // "") | ascii_downcase) as $name
+                  | if ($name | test("^[a-z0-9][a-z0-9._-]*$")) | not then error("invalid image name: \"" + $name + "\"") else . end
+                  | {
+                      name: $name,
+                      key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")),
+                      ref: ($registry + "/" + (if $owner != "" then $owner + "/" else "" end) + $name + ":" + $tag),
+                      registry: $registry,
+                      service: (.["compose-service"] // $name),
+                      health: (.["health-url"] // "")
+                    }
+                  | if $require_health == "true" and .health == "" then error("service image " + .name + " needs a health-url") else . end)
+              | if length == 0 then error("images contains no role=service entry") else . end
+              | if (map(.name) | unique | length) != length then error("image names must be unique") else . end')
+          else
+            # Single-image mode: one service, exactly as before.
+            if [ -n "$IMAGE_REF" ]; then
+              image_ref="$IMAGE_REF"
+              registry=$(lower "${image_ref%%/*}")
+            else
+              image_name=$(lower "${IMAGE_NAME:-$REPO_NAME}")
+              image_path="$image_name"
+              if [ -n "$owner" ]; then
+                image_path="${owner}/$image_name"
+              fi
+              image_ref="${registry}/${image_path}:${tag}"
+            fi
+            services=$(jq -cn --arg name "$(lower "${IMAGE_NAME:-$REPO_NAME}")" --arg ref "$image_ref" --arg registry "$registry" \
+              --arg service "$COMPOSE_SERVICE" --arg health "$HEALTH_URL" \
+              '[{name: $name, key: ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")), ref: $ref, registry: $registry, service: $service, health: $health}]')
+          fi
+
+          {
+            echo "services=$services"
+            echo "ghcr=$(printf '%s' "$services" | jq 'any(.[]; .registry == "ghcr.io")')"
+            # First service's ref; keeps single-image consumers working (outputs may be dropped if they match a secret).
+            echo "image-ref=$(printf '%s' "$services" | jq -r '.[0].ref')"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s' "$services" | jq -r '.[] | "  - \(.name) -> \(.ref) (compose service: \(.service))"'
 
       - name: Login to GHCR (for private images)
-        if: ${{ steps.resolve-image.outputs.registry == 'ghcr.io' }}
+        if: ${{ steps.resolve-image.outputs.ghcr == 'true' }}
         shell: bash
         run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
@@ -268,8 +391,13 @@ jobs:
           fi
 
   synthetic-tests:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.resolve.outputs.services) }}
     runs-on: ubuntu-latest
-    name: Synthetic Tests
+    name: Synthetic Tests (${{ matrix.service.name }})
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -278,7 +406,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          url='${{ inputs.monitoring-url }}'
+          url='${{ matrix.service.url }}'
 
           echo "Running synthetic tests against $url"
           echo ""
@@ -313,59 +441,22 @@ jobs:
 
   summary:
     runs-on: ubuntu-latest
-    needs: [health-monitoring, compliance-check, synthetic-tests]
+    needs: [resolve, health-monitoring, compliance-check, synthetic-tests]
     if: always()
     name: Monitoring Summary
     steps:
-      - name: Resolve image reference
-        id: resolve-image
-        shell: bash
-        run: |
-          set -euo pipefail
-          image_ref='${{ inputs.image-ref }}'
-          if [ -z "$image_ref" ]; then
-            image_name='${{ inputs.image-name }}'
-            if [ -z "$image_name" ]; then
-              image_name='${{ github.event.repository.name }}'
-            fi
-            image_tag='${{ inputs.image-tag }}'
-            if [ -z "$image_tag" ]; then
-              image_tag='${{ github.sha }}'
-            fi
-            registry='${{ inputs.registry }}'
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_owner='${{ inputs.image-owner }}'
-            if [ -z "$image_owner" ] && [ "$registry" = 'ghcr.io' ]; then
-              image_owner='${{ github.repository_owner }}'
-            fi
-            if [ "$registry" = 'ghcr.io' ]; then
-              image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            fi
-            image_name=$(printf '%s' "$image_name" | tr '[:upper:]' '[:lower:]')
-            image_owner=$(printf '%s' "$image_owner" | tr '[:upper:]' '[:lower:]')
-            image_path="$image_name"
-            if [ -n "$image_owner" ]; then
-              image_path="${image_owner}/$image_name"
-            fi
-            image_ref="${registry}/${image_path}:$image_tag"
-          else
-            registry="${image_ref%%/*}"
-            registry=$(printf '%s' "$registry" | tr '[:upper:]' '[:lower:]')
-          fi
-          echo "image-ref=$image_ref" >> "$GITHUB_OUTPUT"
 
       - name: Generate monitoring summary
         shell: bash
+        env:
+          SERVICES: ${{ needs.resolve.outputs.services }}
         run: |
           set -euo pipefail
 
           echo "# Continuous Monitoring Summary"
           echo ""
-          echo "**Image**: ${{ steps.resolve-image.outputs.image-ref }}"
-          echo "**URL**: ${{ inputs.monitoring-url }}"
+          echo "**Services**:"
+          jq -r '.[] | "- \(.name): \(.url)"' <<< "$SERVICES"
           echo "**Report Time**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo ""
           echo "## Results"
